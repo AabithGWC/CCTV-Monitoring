@@ -40,11 +40,11 @@ os.makedirs(ALERTS_DIR, exist_ok=True)
 def load_scanner_roi_config():
     default_cfg = {
         "scanner_roi": [1400, 550, 1920, 850],
-        "entry_line_y": 640,  # Entry threshold line
+        "entry_line_y": 800,  # Room entry threshold line (past the wall scanner)
         "entry_direction": "down",
         "fingerprint_timeout_sec": 3.0,
         "touch_required_sec": 0.1,
-        "violation_grace_sec": 3.5,
+        "violation_grace_sec": 1.5,
     }
     if os.path.exists(ROI_CONFIG_FILE):
         try:
@@ -411,49 +411,41 @@ class DirectionAwareAttendanceTracker:
                             state["touch_start"] = None
                             state["touch_duration"] = 0.0
 
-                # --- 4. PER-HAND VIOLATION DETECTION (ENTERING ONLY) ---
+                # --- 4. VIOLATION DETECTION (ENTERING ONLY) ---
                 if state["direction"] == "ENTERING" and first_cy < line_y:
                     if state["has_punched"]:
                         state["status"] = "COMPLIANT"
                     else:
-                        crossed_line = (pcy >= line_y) or (py2 >= (line_y + 60))
-                        if crossed_line:
-                            if state["line_crossed_at"] is None:
-                                state["line_crossed_at"] = now
+                        # Zone 1: In the Hallway Approaching (pcy < 580 or py1 < 450) -> ALWAYS APPROACHING
+                        in_hallway = (pcy < 580) or (py1 < 450)
 
-                            grace_elapsed = now - state["line_crossed_at"]
+                        # Zone 2: Deep past scanner into the office room (py1 >= 740 or pcy >= 830)
+                        walked_past_scanner = (py1 >= 740) or (pcy >= 830) or (pcy >= line_y)
 
-                            # SMART HAND-INTENT EVALUATION:
-                            # 1) If hands are DOWN (idle at waist, swinging, no reaching) and person is crossing into the room:
-                            #    -> Trigger VIOLATION immediately (e.g. at pcy >= line_y + 30 or grace >= 0.5s)
-                            # 2) If a hand IS reaching towards scanner:
-                            #    -> Allow brief 1.2s grace to touch the pad before concluding violation
-                            hands_down = (not is_reaching_scanner) and (not is_touching_scanner)
-                            hands_down_entering = hands_down and ((pcy >= line_y + 30) or (grace_elapsed >= 0.5))
-                            walked_past = (grace_elapsed >= 1.2) or (pcy >= line_y + 120)
-
-                            if hands_down_entering or walked_past:
-                                state["status"] = "VIOLATION"
-                                if not state["event_logged"]:
-                                    state["event_logged"] = True
-                                    self.missed_punches_count += 1
-                                    state["should_snapshot"] = True
-                                    state["snapshot_saved"] = True
-                                    snapshot_name = f"UNPUNCHED_ENTRY_Track{matched_id}_{time.strftime('%Y%m%d_%H%M%S')}.jpg"
-                                    snapshot_path = os.path.join(ALERTS_DIR, snapshot_name)
-                                    log_attendance_event({
-                                        "track_id": matched_id,
-                                        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-                                        "direction": "ENTERING",
-                                        "fingerprint_used": False,
-                                        "result": "VIOLATION (hands down / unpunched)",
-                                        "conf": round(p["conf"], 2),
-                                        "snapshot": snapshot_path
-                                    })
-                            else:
-                                state["status"] = "CHECKING"
-                        else:
+                        if in_hallway:
                             state["status"] = "APPROACHING"
+                        elif walked_past_scanner and not is_touching_scanner:
+                            # Person has completely walked past the scanner into the office room without punching
+                            state["status"] = "VIOLATION"
+                            if not state["event_logged"]:
+                                state["event_logged"] = True
+                                self.missed_punches_count += 1
+                                state["should_snapshot"] = True
+                                state["snapshot_saved"] = True
+                                snapshot_name = f"UNPUNCHED_ENTRY_Track{matched_id}_{time.strftime('%Y%m%d_%H%M%S')}.jpg"
+                                snapshot_path = os.path.join(ALERTS_DIR, snapshot_name)
+                                log_attendance_event({
+                                    "track_id": matched_id,
+                                    "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                                    "direction": "ENTERING",
+                                    "fingerprint_used": False,
+                                    "result": "VIOLATION (unpunched entry)",
+                                    "conf": round(p["conf"], 2),
+                                    "snapshot": snapshot_path
+                                })
+                        else:
+                            # Currently in scanner zone (Y in 580..820) -> In transit / scanning
+                            state["status"] = "CHECKING"
                 elif state["direction"] == "LEAVING":
                     state["status"] = "IGNORED"
 
