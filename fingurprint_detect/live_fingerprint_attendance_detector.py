@@ -90,9 +90,9 @@ def compute_iou(boxA, boxB):
     return inter / max(union, 1e-6)
 
 
-def extract_hand_kinematics(keypoints, keypoint_confs, poly_np=None, poly_min_x=None, poly_min_y=None, poly_max_y=None, min_conf=0.25):
+def extract_hand_kinematics(keypoints, keypoint_confs, poly_np=None, poly_min_x=None, poly_min_y=None, poly_max_y=None, min_conf=0.15):
     """
-    Computes an 8-point articulated hand/arm kinematic model for both left and right arms:
+    Computes an 8-point articulated hand/arm kinematic model for both left and right arms independently:
     1. Elbow joint
     2. Wrist base
     3. Palm center
@@ -101,7 +101,7 @@ def extract_hand_kinematics(keypoints, keypoint_confs, poly_np=None, poly_min_x=
     6. Middle fingertip
     7. Thumb joint
     8. Thumb tip
-    Classifies hand intent: TOUCHING (on scanner), REACHING (moving towards scanner), or DOWN (idle).
+    Classifies hand intent for EACH arm: TOUCHING (on biometric scanner), REACHING, or DOWN.
     """
     hands = []
     if keypoints is None or len(keypoints) < 11:
@@ -147,16 +147,17 @@ def extract_hand_kinematics(keypoints, keypoint_confs, poly_np=None, poly_min_x=
             pt_middle_tip, pt_thumb_joint, pt_thumb_tip, pt_pinky
         ]
 
-        # Classify Hand Intent:
+        # Classify Hand Intent for this specific hand:
         is_touching = False
         is_reaching = False
         if poly_np is not None and poly_min_x is not None:
+            # Check if any finger/palm point is touching or in direct contact with scanner polygon
             is_touching = any(
-                (cv2.pointPolygonTest(poly_np, (float(pt[0]), float(pt[1])), True) >= 0.0 and pt[0] >= (poly_min_x - 10))
+                (cv2.pointPolygonTest(poly_np, (float(pt[0]), float(pt[1])), True) >= -15.0 and pt[0] >= (poly_min_x - 30))
                 for pt in all_points
             )
             if poly_min_y is not None and poly_max_y is not None:
-                is_reaching = (wx >= (poly_min_x - 130)) and (poly_min_y - 60 <= wy <= poly_max_y + 70)
+                is_reaching = (wx >= (poly_min_x - 160)) and (poly_min_y - 80 <= wy <= poly_max_y + 90)
 
         if is_touching:
             hand_state = "PUNCHING ✓"
@@ -385,29 +386,26 @@ class DirectionAwareAttendanceTracker:
                     state["direction"] = "ENTERING"
 
                 # --- 3. COMPLIANCE & TOUCH PROCESSING ---
-                # Require sustained presence of hand on the scanner pad (>= 0.25s)
                 if is_touching_scanner:
                     if state["touch_start"] is None:
                         state["touch_start"] = now
                     state["touch_last_seen"] = now
                     state["touch_duration"] = now - state["touch_start"]
+                    state["has_punched"] = True
+                    state["status"] = "COMPLIANT"
 
-                    if state["touch_duration"] >= 0.25 and not state["has_punched"]:
-                        state["has_punched"] = True
-                        state["status"] = "COMPLIANT"
+                    if not state["event_logged"]:
+                        state["event_logged"] = True
                         self.verified_punches_count += 1
-
-                        if not state["event_logged"]:
-                            state["event_logged"] = True
-                            log_attendance_event({
-                                "track_id": matched_id,
-                                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-                                "direction": "ENTERING",
-                                "fingerprint_used": True,
-                                "result": "COMPLIANT",
-                                "conf": round(p["conf"], 2),
-                                "snapshot": None
-                            })
+                        log_attendance_event({
+                            "track_id": matched_id,
+                            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                            "direction": "ENTERING",
+                            "fingerprint_used": True,
+                            "result": "COMPLIANT",
+                            "conf": round(p["conf"], 2),
+                            "snapshot": None
+                        })
                 else:
                     if state["touch_start"] is not None and not state["has_punched"]:
                         time_away = now - (state.get("touch_last_seen") or state["touch_start"])
@@ -419,16 +417,20 @@ class DirectionAwareAttendanceTracker:
 
                 # --- 4. VIOLATION DETECTION (ENTERING ONLY) ---
                 if state["direction"] == "ENTERING" and first_cy < cur_line_y:
-                    if state["has_punched"]:
+                    if state["has_punched"] or is_touching_scanner:
+                        state["has_punched"] = True
                         state["status"] = "COMPLIANT"
+                    elif is_reaching_scanner:
+                        # One of the hands is currently reaching for the biometric scanner
+                        state["status"] = "CHECKING"
                     else:
                         in_hallway = (pcy < (cur_line_y - 180)) or (py1 < (cur_line_y - 300))
                         walked_past_scanner = (py1 >= (cur_line_y - 50)) or (pcy >= cur_line_y)
 
                         if in_hallway:
                             state["status"] = "APPROACHING"
-                        elif walked_past_scanner and not is_touching_scanner:
-                            # Person has completely walked past the scanner into the office room without punching
+                        elif walked_past_scanner:
+                            # Both hands failed to touch/reach the biometric scanner when walking past door
                             state["status"] = "VIOLATION"
                             if not state["event_logged"]:
                                 state["event_logged"] = True
@@ -447,7 +449,6 @@ class DirectionAwareAttendanceTracker:
                                     "snapshot": snapshot_path
                                 })
                         else:
-                            # Currently in scanner zone (Y in 580..820) -> In transit / scanning
                             state["status"] = "CHECKING"
                 elif state["direction"] == "LEAVING":
                     state["status"] = "IGNORED"
