@@ -1,0 +1,825 @@
+import os
+import sys
+import time
+import math
+import json
+import argparse
+import threading
+from urllib.parse import quote
+from dataclasses import dataclass
+from collections import deque
+
+import cv2
+import numpy as np
+from dotenv import load_dotenv
+from alert_emailer import ViolationEmailer
+
+# Force OpenCV FFmpeg backend to use RTSP over TCP for reliable local LAN camera access
+os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
+
+# Load environment credentials from parent folder if present
+load_dotenv(dotenv_path=os.path.join("..", ".env"))
+load_dotenv()
+
+# Global Configuration & Paths
+YOLO_MODEL = None
+DETECT_ENABLED = True
+EDIT_ROI_MODE = False
+EDIT_LINE_MODE = False
+MOUSE_DRAGGING = False
+MOUSE_START_PT = None
+MOUSE_CURRENT_PT = None
+
+ROI_CONFIG_FILE = os.path.join(os.path.dirname(__file__), "scanner_roi.json")
+LOG_JSONL_FILE = os.path.join(os.path.dirname(__file__), "attendance_events.jsonl")
+LOG_TXT_FILE = os.path.join(os.path.dirname(__file__), "attendance_events.log")
+ALERTS_DIR = os.path.join(os.path.dirname(__file__), "unpunched_alerts")
+os.makedirs(ALERTS_DIR, exist_ok=True)
+
+
+def load_scanner_roi_config():
+    default_cfg = {
+        "scanner_roi": [1400, 550, 1920, 850],
+        "entry_line_y": 640,  # Entry threshold line
+        "entry_direction": "down",
+        "fingerprint_timeout_sec": 3.0,
+        "touch_required_sec": 0.1,
+        "violation_grace_sec": 3.5,
+    }
+    if os.path.exists(ROI_CONFIG_FILE):
+        try:
+            with open(ROI_CONFIG_FILE, "r") as f:
+                data = json.load(f)
+                default_cfg.update(data)
+        except Exception as e:
+            print(f"[WARNING] Could not read {ROI_CONFIG_FILE}: {e}")
+    return default_cfg
+
+
+def save_scanner_roi_config(cfg):
+    try:
+        with open(ROI_CONFIG_FILE, "w") as f:
+            json.dump(cfg, f, indent=2)
+        print(f"[SUCCESS] Saved configuration to {ROI_CONFIG_FILE}")
+    except Exception as e:
+        print(f"[ERROR] Failed to save {ROI_CONFIG_FILE}: {e}")
+
+
+def log_attendance_event(event_data):
+    try:
+        with open(LOG_JSONL_FILE, "a") as f:
+            f.write(json.dumps(event_data) + "\n")
+        with open(LOG_TXT_FILE, "a") as f:
+            f.write(f"[{event_data['timestamp']}] ID:{event_data['track_id']} | DIR:{event_data['direction']} | RESULT:{event_data['result']} | FINGERPRINT:{event_data['fingerprint_used']}\n")
+        print(f"[EVENT LOGGED] ID:{event_data['track_id']} | Direction:{event_data['direction']} | Result:{event_data['result']}")
+    except Exception as e:
+        print(f"[WARNING] Failed to log event: {e}")
+
+
+def compute_iou(boxA, boxB):
+    x1 = max(boxA[0], boxB[0])
+    y1 = max(boxA[1], boxB[1])
+    x2 = min(boxA[2], boxB[2])
+    y2 = min(boxA[3], boxB[3])
+    inter = max(0, x2 - x1) * max(0, y2 - y1)
+    if inter == 0:
+        return 0.0
+    areaA = (boxA[2] - boxA[0]) * (boxA[3] - boxA[1])
+    areaB = (boxB[2] - boxB[0]) * (boxB[3] - boxB[1])
+    union = float(areaA + areaB - inter)
+    return inter / max(union, 1e-6)
+
+
+@dataclass
+class CameraConfig:
+    name: str
+    ip: str
+    username: str
+    password: str
+    port: str
+    stream_path: str
+
+    @property
+    def rtsp_url(self) -> str:
+        user = quote(self.username, safe="")
+        pwd = quote(self.password, safe="")
+        return f"rtsp://{user}:{pwd}@{self.ip}:{self.port}/{self.stream_path}"
+
+
+def load_camera_configs(selected_cam=1) -> CameraConfig:
+    """Loads door camera configuration from .env file."""
+    username = os.environ.get("CAMERA_USERNAME", "admin")
+    password = os.environ.get("CAMERA_PASSWORD", "Gwc@2026")
+    port = os.environ.get("CAMERA_PORT", "554")
+    stream_path = os.environ.get("CAMERA_STREAM_PATH", "Streaming/Channels/101")
+
+    ip = os.environ.get(f"CAMERA{selected_cam}_IP") or os.environ.get("CAMERA1_IP", "192.168.90.20")
+    return CameraConfig(
+        name=f"CAMERA{selected_cam}",
+        ip=ip.strip(),
+        username=username,
+        password=password,
+        port=port,
+        stream_path=stream_path,
+    )
+
+
+class DirectionAwareAttendanceTracker:
+    """
+    State Machine Tracker for Front Door Fingerprint Compliance:
+    - ENTERING: Tracks person from approach through doorway into room.
+                Person can casually touch scanner at ANY point during entry.
+                Violation is evaluated ONLY AFTER the person has fully entered the room past the door zone.
+    - LEAVING: Completely IGNORED (Gray). No compliance checks, no alerts, no snapshots.
+    - Duplicate Prevention: Each track_id is processed and logged EXACTLY ONCE.
+    - Occlusion Tolerance: Memory retains person tracking state across brief detection losses.
+    """
+
+    def __init__(self, config=None):
+        self.cfg = config or load_scanner_roi_config()
+        self.scanner_roi = self.cfg["scanner_roi"]
+        self.entry_line_y = self.cfg["entry_line_y"]
+        self.entry_direction = self.cfg["entry_direction"]  # "down" or "up"
+        self.timeout_sec = self.cfg.get("fingerprint_timeout_sec", 3.0)
+        self.touch_required_sec = self.cfg.get("touch_required_sec", 0.1)
+        # Generous grace period: wait until person has completely passed into room before concluding violation
+        self.violation_grace_sec = self.cfg.get("violation_grace_sec", 3.5)
+
+        # Default polygon stored as absolute pixels based on 1920×1080.
+        # In process_door_camera_frame this is recomputed each frame from actual W×H.
+        self.scanner_polygon = self.cfg.get("scanner_polygon", [
+            [int(1920 * 0.870), int(1080 * 0.640)],  # Left corner  → (1670, 691)
+            [int(1920 * 0.958), int(1080 * 0.592)],  # Top-right    → (1839, 639)
+            [int(1920 * 0.942), int(1080 * 0.706)]   # Bottom-right → (1809, 763)
+        ])
+        self.tracked_persons = {}  # track_id -> dict state
+        self.next_track_id = 1
+        self.verified_punches_count = 0
+        self.missed_punches_count = 0
+        self.lock = threading.Lock()
+
+    def update_config(self, key, value):
+        with self.lock:
+            self.cfg[key] = value
+            if key == "scanner_roi":
+                self.scanner_roi = value
+            elif key == "scanner_polygon":
+                self.scanner_polygon = value
+            elif key == "entry_line_y":
+                self.entry_line_y = value
+            elif key == "violation_grace_sec":
+                self.violation_grace_sec = value
+            save_scanner_roi_config(self.cfg)
+
+    def get_approach_zone(self):
+        s_x1, s_y1, s_x2, s_y2 = self.scanner_roi
+        return [max(0, s_x1 - 250), max(0, s_y1 - 150), s_x2 + 250, s_y2 + 350]
+
+    def update(self, detected_people):
+        now = time.time()
+        with self.lock:
+            updated_results = []
+            line_y = self.entry_line_y
+            poly_np = np.array(self.scanner_polygon, np.int32)
+            poly_min_x = min(pt[0] for pt in self.scanner_polygon)
+            poly_max_x = max(pt[0] for pt in self.scanner_polygon)
+            poly_min_y = min(pt[1] for pt in self.scanner_polygon)
+            poly_max_y = max(pt[1] for pt in self.scanner_polygon)
+
+            for p in detected_people:
+                px1, py1, px2, py2 = p["box"]
+                pcx, pcy = (px1 + px2) / 2, (py1 + py2) / 2
+                raw_track_id = p.get("track_id")
+
+                # --- 1. PRECISE SCANNER TOUCH / HAND PROXIMITY DETECTION ---
+                is_touching_scanner = False
+                detected_hand_pts = []
+
+                keypoints = p.get("keypoints")
+                keypoint_confs = p.get("keypoint_confs")
+
+                # High-Precision Pose Keypoints: Left & Right Wrists (Pts 9 & 10) + Projected Fingertips
+                if keypoints is not None and len(keypoints) >= 11:
+                    for wrist_idx, elbow_idx in [(10, 8), (9, 7)]:
+                        w_conf = keypoint_confs[wrist_idx] if keypoint_confs is not None else 1.0
+                        if w_conf > 0.25:
+                            wx, wy = float(keypoints[wrist_idx][0]), float(keypoints[wrist_idx][1])
+                            detected_hand_pts.append((wx, wy))
+                            if keypoint_confs is not None and keypoint_confs[elbow_idx] > 0.25:
+                                ex, ey = float(keypoints[elbow_idx][0]), float(keypoints[elbow_idx][1])
+                                fx = wx + 0.30 * (wx - ex)
+                                fy = wy + 0.30 * (wy - ey)
+                                detected_hand_pts.append((fx, fy))
+
+                    for hx, hy in detected_hand_pts:
+                        # Hand must be raised to scanner height and touching the wall scanner polygon
+                        if hx >= (poly_min_x - 35) and (poly_min_y - 40) <= hy <= (poly_max_y + 40):
+                            dist = cv2.pointPolygonTest(poly_np, (hx, hy), True)
+                            if dist >= -25:  # Inside or right at the biometric scanner device
+                                is_touching_scanner = True
+                                break
+
+                # Matching ID: use YOLO tracker ID if available, otherwise match by Centroid + IoU
+                matched_id = raw_track_id
+                if matched_id is None:
+                    best_cost = 9999.0
+                    for tid, state in self.tracked_persons.items():
+                        ecx, ecy = state["last_centroid"]
+                        past_box = state["last_box"]
+                        iou = compute_iou([px1, py1, px2, py2], past_box)
+                        c_dist = math.hypot(pcx - ecx, pcy - ecy)
+                        cost = (1.0 - iou) * 120 + c_dist
+                        if cost < 200 and cost < best_cost:
+                            best_cost = cost
+                            matched_id = tid
+
+                if matched_id is None:
+                    matched_id = self.next_track_id
+                    self.next_track_id += 1
+
+                if matched_id not in self.tracked_persons:
+                    init_dir = "LEAVING" if (pcy >= (line_y - 20) and not is_touching_scanner) else "ENTERING"
+                    init_status = "IGNORED" if init_dir == "LEAVING" else "APPROACHING"
+
+                    self.tracked_persons[matched_id] = {
+                        "first_seen": now,
+                        "last_seen": now,
+                        "first_centroid": (pcx, pcy),
+                        "positions": deque([(pcx, pcy)], maxlen=20),
+                        "direction": init_dir,
+                        "status": init_status,
+                        "has_punched": False,
+                        "touch_start": now if is_touching_scanner else None,
+                        "touch_last_seen": now if is_touching_scanner else None,
+                        "touch_duration": 0.0,
+                        "event_logged": False,
+                        "snapshot_saved": False,
+                        "last_centroid": (pcx, pcy),
+                        "last_box": [px1, py1, px2, py2],
+                        "conf": p["conf"],
+                        "line_crossed_at": None,
+                    }
+
+                state = self.tracked_persons[matched_id]
+                state["last_seen"] = now
+                state["last_centroid"] = (pcx, pcy)
+                state["last_box"] = [px1, py1, px2, py2]
+                state["positions"].append((pcx, pcy))
+                state["conf"] = p["conf"]
+
+                first_cx, first_cy = state["first_centroid"]
+                dy_total = pcy - first_cy  # positive = moving DOWN into office, negative = moving UP away
+
+                # --- 2. STRICT DIRECTION DETERMINATION ---
+                if is_touching_scanner:
+                    state["direction"] = "ENTERING"
+                elif first_cy >= (line_y - 20) or dy_total < -20:
+                    state["direction"] = "LEAVING"
+                    state["status"] = "IGNORED"
+                    state["line_crossed_at"] = None
+                elif dy_total >= 0 and first_cy < line_y:
+                    state["direction"] = "ENTERING"
+
+                # --- 3. COMPLIANCE & TOUCH PROCESSING ---
+                # Require sustained presence of hand at the scanner (>= 0.35s)
+                if is_touching_scanner:
+                    if state["touch_start"] is None:
+                        state["touch_start"] = now
+                    state["touch_last_seen"] = now
+                    state["touch_duration"] = now - state["touch_start"]
+
+                    if state["touch_duration"] >= 0.35 and not state["has_punched"]:
+                        state["has_punched"] = True
+                        state["status"] = "COMPLIANT"
+                        self.verified_punches_count += 1
+
+                        if not state["event_logged"]:
+                            state["event_logged"] = True
+                            log_attendance_event({
+                                "track_id": matched_id,
+                                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                                "direction": "ENTERING",
+                                "fingerprint_used": True,
+                                "result": "COMPLIANT",
+                                "conf": round(p["conf"], 2),
+                                "snapshot": None
+                            })
+                else:
+                    if state["touch_start"] is not None and not state["has_punched"]:
+                        time_away = now - (state.get("touch_last_seen") or state["touch_start"])
+                        if time_away > 0.4:
+                            state["touch_start"] = None
+                            state["touch_duration"] = 0.0
+
+                # --- 4. VIOLATION DETECTION (ENTERING ONLY) ---
+                if state["direction"] == "ENTERING" and first_cy < line_y:
+                    if state["has_punched"]:
+                        state["status"] = "COMPLIANT"
+                    else:
+                        crossed_line = (pcy >= line_y) or (py2 >= (line_y + 80))
+                        if crossed_line:
+                            if state["line_crossed_at"] is None:
+                                state["line_crossed_at"] = now
+
+                            grace_elapsed = now - state["line_crossed_at"]
+
+                            # Conclude VIOLATION only when person has fully entered past scanner:
+                            deep_inside_room = (pcy >= (line_y + 160)) or (py1 >= (line_y + 60))
+                            entry_completed = (
+                                deep_inside_room
+                                and (grace_elapsed >= self.violation_grace_sec)
+                                and (not is_touching_scanner)
+                            )
+
+                            if entry_completed:
+                                state["status"] = "VIOLATION"
+                                if not state["event_logged"]:
+                                    state["event_logged"] = True
+                                    self.missed_punches_count += 1
+                                    state["should_snapshot"] = True
+                                    state["snapshot_saved"] = True
+                                    snapshot_name = f"UNPUNCHED_ENTRY_Track{matched_id}_{time.strftime('%Y%m%d_%H%M%S')}.jpg"
+                                    snapshot_path = os.path.join(ALERTS_DIR, snapshot_name)
+                                    log_attendance_event({
+                                        "track_id": matched_id,
+                                        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                                        "direction": "ENTERING",
+                                        "fingerprint_used": False,
+                                        "result": "VIOLATION",
+                                        "conf": round(p["conf"], 2),
+                                        "snapshot": snapshot_path
+                                    })
+                            else:
+                                state["status"] = "CHECKING"
+                        else:
+                            state["status"] = "APPROACHING"
+                elif state["direction"] == "LEAVING":
+                    state["status"] = "IGNORED"
+
+                should_snap = state.get("should_snapshot", False)
+                state["should_snapshot"] = False
+
+                updated_results.append({
+                    "track_id": matched_id,
+                    "box": [px1, py1, px2, py2],
+                    "conf": p["conf"],
+                    "direction": state["direction"],
+                    "status": state["status"],
+                    "touch_sec": round(state["touch_duration"], 1),
+                    "should_snapshot": should_snap,
+                })
+
+            # --- 5. TRACK CLEANUP ---
+            expired_ids = [tid for tid, s in self.tracked_persons.items() if now - s["last_seen"] > 4.0]
+            for tid in expired_ids:
+                s = self.tracked_persons[tid]
+                if (
+                    s["direction"] == "ENTERING"
+                    and s["first_centroid"][1] < line_y
+                    and s["line_crossed_at"] is not None
+                    and not s["has_punched"]
+                    and not s["event_logged"]
+                ):
+                    s["event_logged"] = True
+                    self.missed_punches_count += 1
+                    snapshot_name = f"UNPUNCHED_ENTRY_Track{tid}_{time.strftime('%Y%m%d_%H%M%S')}.jpg"
+                    snapshot_path = os.path.join(ALERTS_DIR, snapshot_name)
+                    log_attendance_event({
+                        "track_id": tid,
+                        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+                        "direction": "ENTERING",
+                        "fingerprint_used": False,
+                        "result": "VIOLATION (walked inside)",
+                        "conf": round(s["conf"], 2),
+                        "snapshot": snapshot_path
+                    })
+                    print(f"[VIOLATION ALERT] Track {tid} entered room without biometric punch!")
+                del self.tracked_persons[tid]
+
+            return updated_results
+
+
+attendance_tracker = DirectionAwareAttendanceTracker()
+
+# Global emailer — initialised once, reused for every violation alert
+_violation_emailer: ViolationEmailer | None = None
+
+
+def get_violation_emailer(camera_name: str = "CAMERA1") -> ViolationEmailer:
+    """Lazy-initialise the global emailer with the live camera name."""
+    global _violation_emailer
+    if _violation_emailer is None:
+        _violation_emailer = ViolationEmailer(camera_name=camera_name)
+    return _violation_emailer
+
+
+def init_yolo_detector(model_name="yolo11n-pose.pt"):
+    global YOLO_MODEL, DETECT_ENABLED
+    try:
+        from ultralytics import YOLO
+        model_paths = [
+            model_name,
+            "yolo11n-pose.pt",
+            "yolo11s-pose.pt",
+            "yolov8n-pose.pt",
+            os.path.join(".", model_name),
+            os.path.join("..", "productiveity_analysis", model_name),
+            "yolo26s.pt",
+            "yolo11s.pt",
+            "yolov8s.pt",
+            "yolov8m.pt"
+        ]
+        chosen_path = None
+        for p in model_paths:
+            if os.path.exists(p):
+                chosen_path = p
+                break
+        if not chosen_path:
+            chosen_path = model_name
+
+        print(f"[+] Loading Door Fingerprint AI Model: {chosen_path} ...")
+        YOLO_MODEL = YOLO(chosen_path)
+        DETECT_ENABLED = True
+        print("[SUCCESS] Direction-Aware Fingerprint Compliance AI Engine Active!")
+    except Exception as e:
+        print(f"[WARNING] Could not load YOLO model: {e}")
+        DETECT_ENABLED = False
+
+
+def save_missed_person_snapshot(annotated_frame, track_id, camera_name="CAMERA1"):
+    """Save violation snapshot and fire an email alert in the background."""
+    try:
+        os.makedirs(ALERTS_DIR, exist_ok=True)
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        ts_human = time.strftime("%Y-%m-%d %H:%M:%S")
+        filename = f"UNPUNCHED_ENTRY_Track{track_id}_{ts}.jpg"
+        filepath = os.path.join(ALERTS_DIR, filename)
+        ok = cv2.imwrite(filepath, annotated_frame)
+        if ok:
+            print(f"[ALERT SNAPSHOT SAVED] Captured unpunched entry alert -> {filepath}")
+            get_violation_emailer(camera_name).send(
+                snapshot_path=filepath,
+                track_id=track_id,
+                timestamp=ts_human
+            )
+        else:
+            print(f"[ERROR] cv2.imwrite failed to write image file: {filepath}")
+    except Exception as e:
+        print(f"[WARNING] Could not save snapshot: {e}")
+
+
+def on_mouse_event(event, x, y, flags, param):
+    global MOUSE_DRAGGING, MOUSE_START_PT, MOUSE_CURRENT_PT, EDIT_ROI_MODE
+    if not EDIT_ROI_MODE:
+        return
+
+    if event == cv2.EVENT_LBUTTONDOWN:
+        MOUSE_DRAGGING = True
+        MOUSE_START_PT = (x, y)
+        MOUSE_CURRENT_PT = (x, y)
+
+    elif event == cv2.EVENT_MOUSEMOVE:
+        if MOUSE_DRAGGING:
+            MOUSE_CURRENT_PT = (x, y)
+
+    elif event == cv2.EVENT_LBUTTONUP:
+        if MOUSE_DRAGGING and MOUSE_START_PT is not None:
+            MOUSE_DRAGGING = False
+            x1 = min(MOUSE_START_PT[0], x)
+            y1 = min(MOUSE_START_PT[1], y)
+            x2 = max(MOUSE_START_PT[0], x)
+            y2 = max(MOUSE_START_PT[1], y)
+
+            if (x2 - x1) > 40 and (y2 - y1) > 40:
+                attendance_tracker.update_config("scanner_roi", [x1, y1, x2, y2])
+                print(f"[ROI UPDATED] New Scanner ROI set to: [{x1}, {y1}, {x2}, {y2}]")
+            MOUSE_START_PT = None
+            MOUSE_CURRENT_PT = None
+
+
+def process_door_camera_frame(cam_name, frame):
+    """
+    Processes front entrance door camera stream:
+    - Renders Virtual Entry Line & Biometric Scanner ROI.
+    - Determines Person Direction: ENTERING vs LEAVING.
+    - ENTERING -> Check Fingerprint Compliance -> COMPLIANT (Green) or VIOLATION (Red + Snapshot + Log).
+    - LEAVING -> IGNORED (Slate Gray). No alerts, no compliance checks.
+    """
+    if not DETECT_ENABLED or YOLO_MODEL is None or frame is None:
+        return frame
+
+    try:
+        annotated = frame.copy()
+        h_img, w_img, _ = frame.shape
+
+        # Recompute scanner triangle from actual frame dimensions (resolution-independent)
+        attendance_tracker.scanner_polygon = [
+            [int(w_img * 0.870), int(h_img * 0.640)],  # Left corner — toward hallway
+            [int(w_img * 0.958), int(h_img * 0.592)],  # Top-right   — above scanner on wall
+            [int(w_img * 0.942), int(h_img * 0.706)]   # Bot-right   — below scanner on wall
+        ]
+        poly_xs = [pt[0] for pt in attendance_tracker.scanner_polygon]
+        poly_ys = [pt[1] for pt in attendance_tracker.scanner_polygon]
+        attendance_tracker.scanner_roi = [
+            min(poly_xs), min(poly_ys), max(poly_xs), max(poly_ys)
+        ]
+
+        # Use YOLO tracking engine (ByteTrack if available) for persistent track IDs across frames
+        try:
+            res_all = YOLO_MODEL.track(frame, imgsz=640, conf=0.22, persist=True, tracker="bytetrack.yaml", verbose=False)[0]
+        except Exception:
+            res_all = YOLO_MODEL.predict(frame, imgsz=640, conf=0.22, verbose=False)[0]
+
+        detected_people = []
+        has_kpts = hasattr(res_all, "keypoints") and res_all.keypoints is not None
+
+        if res_all.boxes:
+            for idx, b in enumerate(res_all.boxes):
+                conf = float(b.conf[0].item())
+                x1, y1, x2, y2 = [int(v) for v in b.xyxy[0].cpu().numpy()]
+                w, h = x2 - x1, y2 - y1
+                track_id = int(b.id[0].item()) if b.id is not None else None
+
+                # Ignore non-person posters/art
+                if 1400 <= x1 <= 1650 and y1 <= 200 and w < 110 and h > 150:
+                    continue
+
+                kpts_xy = None
+                kpts_conf = None
+                if has_kpts and len(res_all.keypoints.xy) > idx:
+                    kpts_xy = res_all.keypoints.xy[idx].cpu().numpy()
+                    if res_all.keypoints.conf is not None and len(res_all.keypoints.conf) > idx:
+                        kpts_conf = res_all.keypoints.conf[idx].cpu().numpy()
+
+                detected_people.append({
+                    "conf": conf,
+                    "box": [x1, y1, x2, y2],
+                    "w": w,
+                    "h": h,
+                    "track_id": track_id,
+                    "keypoints": kpts_xy,
+                    "keypoint_confs": kpts_conf
+                })
+
+        # Run Direction-Aware Attendance Compliance Tracking
+        results = attendance_tracker.update(detected_people)
+
+        # 1. Draw Configurable Virtual Entry Line (Bright Yellow / Cyan)
+        line_y = attendance_tracker.entry_line_y
+        cv2.line(annotated, (0, line_y), (w_img, line_y), (0, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(annotated, f"▼ VIRTUAL ENTRY LINE (ENTRY DIRECTION: DOWN) Y={line_y} ▼", (20, max(line_y - 8, 20)),
+                    cv2.FONT_HERSHEY_DUPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
+
+        # 2. Draw Biometric Scanner Zone — Cyan Triangle tightly wrapping the physical scanner
+        tri = attendance_tracker.scanner_polygon
+        poly_pts = np.array(tri, np.int32).reshape((-1, 1, 2))
+        overlay = annotated.copy()
+        cv2.fillPoly(overlay, [poly_pts], (255, 200, 0))
+        cv2.addWeighted(overlay, 0.18, annotated, 0.82, 0, annotated)
+        cv2.polylines(annotated, [poly_pts], True, (255, 200, 0), 2, cv2.LINE_AA)
+        left_pt = tri[0]
+        label_x = max(left_pt[0] - 10, 10)
+        label_y = max(left_pt[1] - 12, 20)
+        cv2.putText(annotated, "BIOMETRIC FINGERPRINT", (label_x, label_y),
+                    cv2.FONT_HERSHEY_DUPLEX, 0.45, (255, 200, 0), 1, cv2.LINE_AA)
+
+        # Draw hand keypoint dots if visible
+        for p in detected_people:
+            kpts = p.get("keypoints")
+            kconfs = p.get("keypoint_confs")
+            if kpts is not None and len(kpts) >= 11:
+                for wrist_idx in (9, 10):
+                    if kconfs is None or kconfs[wrist_idx] > 0.25:
+                        wx, wy = int(kpts[wrist_idx][0]), int(kpts[wrist_idx][1])
+                        cv2.circle(annotated, (wx, wy), 4, (0, 255, 255), -1, cv2.LINE_AA)
+
+        # Draw mouse dragging rectangle when user is editing ROI
+        if MOUSE_DRAGGING and MOUSE_START_PT and MOUSE_CURRENT_PT:
+            mx1 = min(MOUSE_START_PT[0], MOUSE_CURRENT_PT[0])
+            my1 = min(MOUSE_START_PT[1], MOUSE_CURRENT_PT[1])
+            mx2 = max(MOUSE_START_PT[0], MOUSE_CURRENT_PT[0])
+            my2 = max(MOUSE_START_PT[1], MOUSE_CURRENT_PT[1])
+            cv2.rectangle(annotated, (mx1, my1), (mx2, my2), (0, 255, 255), 2)
+            cv2.putText(annotated, "DRAWING NEW SCANNER ROI...", (mx1, max(my1 - 8, 20)),
+                        cv2.FONT_HERSHEY_DUPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
+
+        # 3. Draw Bounding Boxes with Track ID, Direction, and Compliance Status
+        for r in results:
+            x1, y1, x2, y2 = r["box"]
+            status = r["status"]
+            direction = r["direction"]
+            touch_sec = r["touch_sec"]
+            track_id = r["track_id"]
+            should_snap = r.get("should_snapshot", False)
+
+            if status == "COMPLIANT":
+                color = (74, 222, 128)   # Lime Green
+                label = f"ID:{track_id} | ENTERING | COMPLIANT ✓ ({touch_sec}s)"
+                thickness = 2
+            elif status == "VIOLATION":
+                color = (0, 0, 255)      # Bold Red
+                label = f"ID:{track_id} | ENTERING | VIOLATION! NO FINGERPRINT"
+                thickness = 3
+            elif status == "CHECKING":
+                color = (0, 165, 255)    # Orange — crossed line, grace running
+                label = f"ID:{track_id} | CHECKING... ({touch_sec}s)"
+                thickness = 2
+            elif status == "IGNORED" or direction == "LEAVING":
+                color = (148, 163, 184)  # Slate Gray
+                label = f"ID:{track_id} | LEAVING (IGNORED)"
+                thickness = 1
+            else:  # APPROACHING
+                color = (200, 200, 200)  # Light gray
+                label = f"ID:{track_id} | APPROACHING"
+                thickness = 1
+
+            cv2.rectangle(annotated, (x1, y1), (x2, y2), color, thickness, cv2.LINE_AA)
+            cv2.putText(annotated, label, (x1, max(y1 - 8, 20)),
+                        cv2.FONT_HERSHEY_DUPLEX, 0.48, color, 1, cv2.LINE_AA)
+
+            # Highlight Red Banner if person violated attendance compliance
+            if status == "VIOLATION":
+                cv2.rectangle(annotated, (x1, y1), (x2, y1 + 30), (0, 0, 255), -1)
+                cv2.putText(annotated, "ALERT: UNPUNCHED ENTRY!", (x1 + 10, y1 + 20),
+                            cv2.FONT_HERSHEY_DUPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+
+            # Auto-save snapshot + trigger email alert on violation
+            if should_snap:
+                save_missed_person_snapshot(annotated, track_id, cam_name)
+
+        # 4. Render Top HUD Banner
+        v_count = attendance_tracker.verified_punches_count
+        m_count = attendance_tracker.missed_punches_count
+        hud_overlay = annotated.copy()
+        cv2.rectangle(hud_overlay, (0, 0), (w_img, 50), (15, 23, 42), -1)
+        cv2.addWeighted(hud_overlay, 0.75, annotated, 0.25, 0, annotated)
+
+        if EDIT_ROI_MODE:
+            hud_text = f"[ROI EDIT MODE] Click & Drag mouse to draw Scanner Box | Press 'E' to Exit"
+            cv2.putText(annotated, hud_text, (20, 32), cv2.FONT_HERSHEY_DUPLEX, 0.5, (0, 255, 255), 1, cv2.LINE_AA)
+        elif EDIT_LINE_MODE:
+            hud_text = f"[ENTRY LINE EDIT MODE] Use UP / DOWN Arrow Keys to move Entry Line | Press 'L' to Exit"
+            cv2.putText(annotated, hud_text, (20, 32), cv2.FONT_HERSHEY_DUPLEX, 0.5, (0, 255, 255), 1, cv2.LINE_AA)
+        else:
+            hud_text = f"FRONT DOOR MONITOR ({cam_name}) | COMPLIANT: {v_count} | VIOLATIONS: {m_count} | Keys: [E] ROI [L] Line [Q] Quit"
+            cv2.putText(annotated, hud_text, (20, 32), cv2.FONT_HERSHEY_DUPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+
+        return annotated
+    except Exception as e:
+        return frame
+
+
+class AsyncCameraStream:
+    """Reads frames from front door RTSP camera with zero latency and smooth rendering."""
+
+    def __init__(self, config: CameraConfig, reconnect_delay: float = 2.0):
+        self.config = config
+        self.reconnect_delay = reconnect_delay
+        self._capture = None
+        self._raw_frame = None
+        self._annotated_frame = None
+        self._lock = threading.Lock()
+        self._running = False
+        self._capture_thread = None
+        self._ai_thread = None
+
+    def start(self):
+        self._running = True
+        self._capture_thread = threading.Thread(target=self._run_capture, daemon=True)
+        self._ai_thread = threading.Thread(target=self._run_ai, daemon=True)
+        self._capture_thread.start()
+        self._ai_thread.start()
+        return self
+
+    def stop(self):
+        self._running = False
+        if self._capture:
+            self._capture.release()
+
+    def _connect(self):
+        capture = cv2.VideoCapture(self.config.rtsp_url, cv2.CAP_FFMPEG)
+        capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        return capture
+
+    def _run_capture(self):
+        while self._running:
+            self._capture = self._connect()
+            if not self._capture.isOpened():
+                print(f"[{self.config.name}] Connecting to {self.config.ip}... retrying in {self.reconnect_delay}s")
+                time.sleep(self.reconnect_delay)
+                continue
+
+            print(f"[ONLINE] Front Door Camera Stream Live! ({self.config.ip})")
+            while self._running:
+                try:
+                    for _ in range(2):
+                        self._capture.grab()
+                    ok, frame = self._capture.retrieve()
+                except Exception:
+                    ok, frame = False, None
+
+                if not ok or frame is None:
+                    print(f"[{self.config.name}] Stream interrupted, reconnecting...")
+                    break
+                with self._lock:
+                    self._raw_frame = frame
+
+            self._capture.release()
+            if self._running:
+                time.sleep(self.reconnect_delay)
+
+    def _run_ai(self):
+        while self._running:
+            frame_to_process = None
+            with self._lock:
+                if self._raw_frame is not None:
+                    frame_to_process = self._raw_frame.copy()
+
+            if frame_to_process is not None and DETECT_ENABLED:
+                annotated = process_door_camera_frame(self.config.name, frame_to_process)
+                with self._lock:
+                    self._annotated_frame = annotated
+                time.sleep(0.01)
+            else:
+                time.sleep(0.02)
+
+    def get_display_frame(self):
+        with self._lock:
+            if self._annotated_frame is not None:
+                return self._annotated_frame.copy()
+            elif self._raw_frame is not None:
+                return self._raw_frame.copy()
+            return None
+
+
+def main():
+    global EDIT_ROI_MODE, EDIT_LINE_MODE
+    parser = argparse.ArgumentParser(description="Direction-Aware Front Door Fingerprint Attendance Compliance Detector")
+    parser.add_argument("--cam", type=int, default=1, help="Door camera number from .env (default: 1)")
+    parser.add_argument("--model", type=str, default="yolo11n-pose.pt", help="YOLO model path")
+    args = parser.parse_args()
+
+    config = load_camera_configs(selected_cam=args.cam)
+    # Pre-initialise emailer with the correct camera name
+    get_violation_emailer(camera_name=config.name)
+
+    print("=" * 75)
+    print("  DIRECTION-AWARE FRONT DOOR FINGERPRINT ATTENDANCE COMPLIANCE AI DETECTOR")
+    print("=" * 75)
+    print(f" [+] Door Camera: {config.name} ({config.ip})")
+    print(f" [+] Rule 1: ENTERING → Check Thumb/Fingerprint -> [GREEN] COMPLIANT or [RED] VIOLATION")
+    print(f" [+] Rule 2: LEAVING  → [SLATE GRAY] IGNORED (Zero Alerts/Snapshots)")
+    print(f" [+] Shortcuts: Press 'E' (Edit Scanner Box) | 'L' (Edit Virtual Entry Line) | 'Q' (Quit)")
+    print("=" * 75 + "\n")
+
+    # Initialize Model
+    init_yolo_detector(model_name=args.model)
+
+    # Start Async Camera Stream
+    stream = AsyncCameraStream(config).start()
+
+    print("[+] Launching Front Door Fingerprint Monitor... Press 'q' to EXIT.\n")
+
+    window_name = f"FRONT DOOR FINGERPRINT MONITOR ({config.name})"
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(window_name, 960, 540)
+    cv2.setMouseCallback(window_name, on_mouse_event)
+
+    try:
+        while True:
+            frame = stream.get_display_frame()
+            if frame is not None:
+                cv2.imshow(window_name, frame)
+
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord("q"):
+                print("\n[+] Exiting Direction-Aware Fingerprint Compliance Monitor...")
+                break
+            elif key == ord("e") or key == ord("E"):
+                EDIT_ROI_MODE = not EDIT_ROI_MODE
+                mode_str = "ENABLED" if EDIT_ROI_MODE else "DISABLED"
+                print(f"[+] ROI Edit Mode {mode_str}. (Click & drag mouse on window to adjust scanner box)")
+            elif key == ord("l") or key == ord("L"):
+                EDIT_LINE_MODE = not EDIT_LINE_MODE
+                mode_str = "ENABLED" if EDIT_LINE_MODE else "DISABLED"
+                print(f"[+] Entry Line Edit Mode {mode_str}. (Use Up/Down arrow keys to adjust Virtual Entry Line)")
+            elif EDIT_LINE_MODE and key == 82:  # Up Arrow
+                attendance_tracker.update_config("entry_line_y", max(50, attendance_tracker.entry_line_y - 10))
+                print(f"[ENTRY LINE UPDATED] Y = {attendance_tracker.entry_line_y}")
+            elif EDIT_LINE_MODE and key == 84:  # Down Arrow
+                attendance_tracker.update_config("entry_line_y", min(1080, attendance_tracker.entry_line_y + 10))
+                print(f"[ENTRY LINE UPDATED] Y = {attendance_tracker.entry_line_y}")
+            elif key == ord("r") or key == ord("R"):
+                attendance_tracker.update_config("scanner_roi", [1400, 480, 1920, 900])
+                attendance_tracker.update_config("entry_line_y", 620)
+                print(f"[+] Reset Scanner ROI & Entry Line to default.")
+    except KeyboardInterrupt:
+        print("\n[+] Interrupted by user. Closing...")
+    finally:
+        stream.stop()
+        cv2.destroyAllWindows()
+        print("[+] Door camera stream stopped cleanly.")
+
+
+if __name__ == "__main__":
+    main()

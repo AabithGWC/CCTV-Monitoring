@@ -1,0 +1,29 @@
+# Credentials & Sensitive Config
+.env
+*.env
+
+# Large Model Weights (YOLO downloads automatically)
+*.pt
+*.onnx
+*.engine
+
+# Python cache & virtual environments
+__pycache__/
+*.pyc
+*.pyo
+venv/
+.venv/
+env/
+
+# Alert snapshots & media logs
+unpunched_alerts/
+*.log
+*.jsonl
+attendance_events.log
+attendance_events.jsonl
+
+# IDE & OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
