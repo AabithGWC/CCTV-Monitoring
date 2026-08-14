@@ -90,7 +90,7 @@ def compute_iou(boxA, boxB):
     return inter / max(union, 1e-6)
 
 
-def extract_hand_kinematics(keypoints, keypoint_confs, min_conf=0.25):
+def extract_hand_kinematics(keypoints, keypoint_confs, poly_np, poly_min_x, poly_min_y, poly_max_y, min_conf=0.25):
     """
     Computes an 8-point articulated hand/arm kinematic model for both left and right arms:
     1. Elbow joint
@@ -101,13 +101,12 @@ def extract_hand_kinematics(keypoints, keypoint_confs, min_conf=0.25):
     6. Middle fingertip
     7. Thumb joint
     8. Thumb tip
-    Returns: list of dicts with all keypoints, bones, and fingertips for touch/motion tracking.
+    Classifies hand intent: TOUCHING (on scanner), REACHING (moving towards scanner), or DOWN (idle).
     """
     hands = []
     if keypoints is None or len(keypoints) < 11:
         return hands
 
-    # Arms to inspect: (Wrist idx, Elbow idx, Side label)
     arms = [(10, 8, "Right"), (9, 7, "Left")]
 
     for wrist_idx, elbow_idx, side in arms:
@@ -124,7 +123,6 @@ def extract_hand_kinematics(keypoints, keypoint_confs, min_conf=0.25):
             L = math.hypot(vx, vy)
             if L > 10:
                 ux, uy = vx / L, vy / L
-                # Normal vector perpendicular to forearm
                 nx, ny = (-uy, ux) if side == "Right" else (uy, -ux)
             else:
                 ux, uy, nx, ny = 1.0, 0.0, 0.0, 1.0
@@ -134,7 +132,7 @@ def extract_hand_kinematics(keypoints, keypoint_confs, min_conf=0.25):
             L = 60.0
             ex, ey = wx - 60.0, wy
 
-        # Multi-Point Hand Constellation:
+        # 8-Point Hand Constellation:
         pt_wrist = (wx, wy)
         pt_palm = (wx + ux * 0.18 * L, wy + uy * 0.18 * L)
         pt_knuckle = (wx + ux * 0.32 * L, wy + uy * 0.32 * L)
@@ -148,6 +146,23 @@ def extract_hand_kinematics(keypoints, keypoint_confs, min_conf=0.25):
             pt_wrist, pt_palm, pt_knuckle, pt_index_tip,
             pt_middle_tip, pt_thumb_joint, pt_thumb_tip, pt_pinky
         ]
+
+        # Classify Hand Intent:
+        # A) Is touching: Any point is strictly inside scanner polygon on the wall
+        is_touching = any(
+            (cv2.pointPolygonTest(poly_np, (pt[0], pt[1]), True) >= 0.0 and pt[0] >= (poly_min_x - 10))
+            for pt in all_points
+        )
+
+        # B) Is reaching: Hand is raised towards scanner height and approaching wall
+        is_reaching = (wx >= (poly_min_x - 130)) and (poly_min_y - 60 <= wy <= poly_max_y + 70)
+
+        if is_touching:
+            hand_state = "PUNCHING ✓"
+        elif is_reaching:
+            hand_state = "REACHING"
+        else:
+            hand_state = "DOWN"
 
         hands.append({
             "side": side,
@@ -164,7 +179,10 @@ def extract_hand_kinematics(keypoints, keypoint_confs, min_conf=0.25):
             "all_points": all_points,
             "unit_vec": (ux, uy),
             "conf": w_conf,
-            "length": L
+            "length": L,
+            "is_touching": is_touching,
+            "is_reaching": is_reaching,
+            "hand_state": hand_state,
         })
 
     return hands
@@ -208,9 +226,8 @@ class DirectionAwareAttendanceTracker:
     """
     State Machine Tracker for Front Door Fingerprint Compliance:
     - Multi-Point Hand & Finger Motion Tracking (8 articulated points per hand)
-    - Velocity Vector & Trajectory Motion Analysis
-    - ENTERING: Evaluates biometric scan compliance using finger/hand kinematics.
-    - LEAVING: Completely IGNORED (Gray).
+    - Per-Hand Punch Intent Tracking (PUNCHING vs REACHING vs DOWN)
+    - Instant Violation Trigger when person crosses with hands down (no punch attempt)
     - Duplicate Prevention: Each track_id is processed and logged EXACTLY ONCE.
     """
 
@@ -221,7 +238,7 @@ class DirectionAwareAttendanceTracker:
         self.entry_direction = self.cfg["entry_direction"]  # "down" or "up"
         self.timeout_sec = self.cfg.get("fingerprint_timeout_sec", 3.0)
         self.touch_required_sec = self.cfg.get("touch_required_sec", 0.1)
-        self.violation_grace_sec = self.cfg.get("violation_grace_sec", 3.5)
+        self.violation_grace_sec = self.cfg.get("violation_grace_sec", 1.5)
 
         self.scanner_polygon = self.cfg.get("scanner_polygon", [
             [int(1920 * 0.885), int(1080 * 0.635)],
@@ -267,19 +284,23 @@ class DirectionAwareAttendanceTracker:
                 pcx, pcy = (px1 + px2) / 2, (py1 + py2) / 2
                 raw_track_id = p.get("track_id")
 
-                # --- 1. MULTI-POINT ARTICULATED HAND KINEMATICS & SCANNER TOUCH ---
-                is_touching_scanner = False
-                touching_points = []
-                hand_models = extract_hand_kinematics(p.get("keypoints"), p.get("keypoint_confs"), min_conf=0.28)
+                # --- 1. MULTI-POINT HAND KINEMATICS & PER-HAND INTENT ---
+                hand_models = extract_hand_kinematics(
+                    p.get("keypoints"), p.get("keypoint_confs"),
+                    poly_np, poly_min_x, poly_min_y, poly_max_y, min_conf=0.25
+                )
 
-                for hand in hand_models:
-                    for pt in hand["all_points"]:
-                        hx, hy = pt
-                        # Strict: Test if any hand/finger point is inside or directly on the physical scanner polygon
-                        dist = cv2.pointPolygonTest(poly_np, (hx, hy), True)
-                        if dist >= 0.0 and hx >= (poly_min_x - 10):
-                            is_touching_scanner = True
-                            touching_points.append(pt)
+                is_touching_scanner = any(h.get("is_touching", False) for h in hand_models)
+                is_reaching_scanner = any(h.get("is_reaching", False) for h in hand_models)
+
+                # Format hand status summaries (e.g. Left: DOWN | Right: REACHING)
+                l_hand_status = "DOWN"
+                r_hand_status = "DOWN"
+                for h in hand_models:
+                    if h["side"] == "Left":
+                        l_hand_status = h["hand_state"]
+                    elif h["side"] == "Right":
+                        r_hand_status = h["hand_state"]
 
                 # Matching ID: use YOLO tracker ID if available, otherwise match by Centroid + IoU
                 matched_id = raw_track_id
@@ -322,6 +343,8 @@ class DirectionAwareAttendanceTracker:
                         "conf": p["conf"],
                         "line_crossed_at": None,
                         "hand_speed": 0.0,
+                        "l_hand": l_hand_status,
+                        "r_hand": r_hand_status,
                     }
 
                 state = self.tracked_persons[matched_id]
@@ -330,6 +353,8 @@ class DirectionAwareAttendanceTracker:
                 state["last_box"] = [px1, py1, px2, py2]
                 state["positions"].append((pcx, pcy))
                 state["conf"] = p["conf"]
+                state["l_hand"] = l_hand_status
+                state["r_hand"] = r_hand_status
 
                 # Track Hand Movement Velocity & Trail
                 if hand_models:
@@ -355,14 +380,14 @@ class DirectionAwareAttendanceTracker:
                     state["direction"] = "ENTERING"
 
                 # --- 3. COMPLIANCE & TOUCH PROCESSING ---
-                # Require sustained presence of hand at the scanner (>= 0.35s)
+                # Require sustained presence of hand on the scanner pad (>= 0.25s)
                 if is_touching_scanner:
                     if state["touch_start"] is None:
                         state["touch_start"] = now
                     state["touch_last_seen"] = now
                     state["touch_duration"] = now - state["touch_start"]
 
-                    if state["touch_duration"] >= 0.35 and not state["has_punched"]:
+                    if state["touch_duration"] >= 0.25 and not state["has_punched"]:
                         state["has_punched"] = True
                         state["status"] = "COMPLIANT"
                         self.verified_punches_count += 1
@@ -385,27 +410,28 @@ class DirectionAwareAttendanceTracker:
                             state["touch_start"] = None
                             state["touch_duration"] = 0.0
 
-                # --- 4. VIOLATION DETECTION (ENTERING ONLY) ---
+                # --- 4. PER-HAND VIOLATION DETECTION (ENTERING ONLY) ---
                 if state["direction"] == "ENTERING" and first_cy < line_y:
                     if state["has_punched"]:
                         state["status"] = "COMPLIANT"
                     else:
-                        crossed_line = (pcy >= line_y) or (py2 >= (line_y + 80))
+                        crossed_line = (pcy >= line_y) or (py2 >= (line_y + 60))
                         if crossed_line:
                             if state["line_crossed_at"] is None:
                                 state["line_crossed_at"] = now
 
                             grace_elapsed = now - state["line_crossed_at"]
 
-                            # Conclude VIOLATION only when person has fully entered past scanner:
-                            deep_inside_room = (pcy >= (line_y + 160)) or (py1 >= (line_y + 60))
-                            entry_completed = (
-                                deep_inside_room
-                                and (grace_elapsed >= self.violation_grace_sec)
-                                and (not is_touching_scanner)
-                            )
+                            # SMART HAND-INTENT EVALUATION:
+                            # 1) If hands are DOWN (idle at waist, swinging, no reaching) and person is crossing into the room:
+                            #    -> Trigger VIOLATION immediately (e.g. at pcy >= line_y + 30 or grace >= 0.5s)
+                            # 2) If a hand IS reaching towards scanner:
+                            #    -> Allow brief 1.2s grace to touch the pad before concluding violation
+                            hands_down = (not is_reaching_scanner) and (not is_touching_scanner)
+                            hands_down_entering = hands_down and ((pcy >= line_y + 30) or (grace_elapsed >= 0.5))
+                            walked_past = (grace_elapsed >= 1.2) or (pcy >= line_y + 120)
 
-                            if entry_completed:
+                            if hands_down_entering or walked_past:
                                 state["status"] = "VIOLATION"
                                 if not state["event_logged"]:
                                     state["event_logged"] = True
@@ -419,7 +445,7 @@ class DirectionAwareAttendanceTracker:
                                         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
                                         "direction": "ENTERING",
                                         "fingerprint_used": False,
-                                        "result": "VIOLATION",
+                                        "result": "VIOLATION (hands down / unpunched)",
                                         "conf": round(p["conf"], 2),
                                         "snapshot": snapshot_path
                                     })
@@ -441,6 +467,8 @@ class DirectionAwareAttendanceTracker:
                     "status": state["status"],
                     "touch_sec": round(state["touch_duration"], 1),
                     "should_snapshot": should_snap,
+                    "l_hand": state["l_hand"],
+                    "r_hand": state["r_hand"],
                 })
 
             # --- 5. TRACK CLEANUP ---
@@ -739,6 +767,9 @@ def process_door_camera_frame(cam_name, frame):
             track_id = r["track_id"]
             should_snap = r.get("should_snapshot", False)
 
+            l_h = r.get("l_hand", "DOWN")
+            r_h = r.get("r_hand", "DOWN")
+
             if status == "COMPLIANT":
                 color = (74, 222, 128)   # Lime Green
                 label = f"ID:{track_id} | ENTERING | COMPLIANT ✓ ({touch_sec}s)"
@@ -749,7 +780,7 @@ def process_door_camera_frame(cam_name, frame):
                 thickness = 3
             elif status == "CHECKING":
                 color = (0, 165, 255)    # Orange — crossed line, grace running
-                label = f"ID:{track_id} | CHECKING... ({touch_sec}s)"
+                label = f"ID:{track_id} | CHECKING (L:{l_h} | R:{r_h})"
                 thickness = 2
             elif status == "IGNORED" or direction == "LEAVING":
                 color = (148, 163, 184)  # Slate Gray
@@ -757,7 +788,7 @@ def process_door_camera_frame(cam_name, frame):
                 thickness = 1
             else:  # APPROACHING
                 color = (200, 200, 200)  # Light gray
-                label = f"ID:{track_id} | APPROACHING"
+                label = f"ID:{track_id} | APPROACHING (L:{l_h} | R:{r_h})"
                 thickness = 1
 
             cv2.rectangle(annotated, (x1, y1), (x2, y2), color, thickness, cv2.LINE_AA)
