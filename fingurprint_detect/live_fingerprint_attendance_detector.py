@@ -201,23 +201,22 @@ class DirectionAwareAttendanceTracker:
                 # High-Precision Pose Keypoints: Left & Right Wrists (Pts 9 & 10) + Projected Fingertips
                 if keypoints is not None and len(keypoints) >= 11:
                     for wrist_idx, elbow_idx in [(10, 8), (9, 7)]:
-                        w_conf = keypoint_confs[wrist_idx] if keypoint_confs is not None else 1.0
-                        if w_conf > 0.25:
+                        w_conf = float(keypoint_confs[wrist_idx]) if keypoint_confs is not None else 1.0
+                        if w_conf >= 0.30:
                             wx, wy = float(keypoints[wrist_idx][0]), float(keypoints[wrist_idx][1])
                             detected_hand_pts.append((wx, wy))
-                            if keypoint_confs is not None and keypoint_confs[elbow_idx] > 0.25:
+                            if keypoint_confs is not None and float(keypoint_confs[elbow_idx]) >= 0.30:
                                 ex, ey = float(keypoints[elbow_idx][0]), float(keypoints[elbow_idx][1])
-                                fx = wx + 0.30 * (wx - ex)
-                                fy = wy + 0.30 * (wy - ey)
+                                fx = wx + 0.25 * (wx - ex)
+                                fy = wy + 0.25 * (wy - ey)
                                 detected_hand_pts.append((fx, fy))
 
                     for hx, hy in detected_hand_pts:
-                        # Hand must be raised to scanner height and touching the wall scanner polygon
-                        if hx >= (poly_min_x - 35) and (poly_min_y - 40) <= hy <= (poly_max_y + 40):
-                            dist = cv2.pointPolygonTest(poly_np, (hx, hy), True)
-                            if dist >= -25:  # Inside or right at the biometric scanner device
-                                is_touching_scanner = True
-                                break
+                        # Strict: Hand point must be physically inside or directly touching the scanner polygon
+                        dist = cv2.pointPolygonTest(poly_np, (hx, hy), True)
+                        if dist >= 0.0 and hx >= (poly_min_x - 10):
+                            is_touching_scanner = True
+                            break
 
                 # Matching ID: use YOLO tracker ID if available, otherwise match by Centroid + IoU
                 matched_id = raw_track_id
@@ -512,11 +511,11 @@ def process_door_camera_frame(cam_name, frame):
         annotated = frame.copy()
         h_img, w_img, _ = frame.shape
 
-        # Recompute scanner triangle from actual frame dimensions (resolution-independent)
+        # Recompute scanner triangle from actual frame dimensions (tightly wrapping the physical wall scanner)
         attendance_tracker.scanner_polygon = [
-            [int(w_img * 0.870), int(h_img * 0.640)],  # Left corner — toward hallway
-            [int(w_img * 0.958), int(h_img * 0.592)],  # Top-right   — above scanner on wall
-            [int(w_img * 0.942), int(h_img * 0.706)]   # Bot-right   — below scanner on wall
+            [int(w_img * 0.885), int(h_img * 0.635)],  # Left edge of scanner mount
+            [int(w_img * 0.962), int(h_img * 0.585)],  # Top-right — top of scanner on wall
+            [int(w_img * 0.948), int(h_img * 0.720)]   # Bot-right — bottom of scanner on wall
         ]
         poly_xs = [pt[0] for pt in attendance_tracker.scanner_polygon]
         poly_ys = [pt[1] for pt in attendance_tracker.scanner_polygon]
@@ -583,15 +582,19 @@ def process_door_camera_frame(cam_name, frame):
         cv2.putText(annotated, "BIOMETRIC FINGERPRINT", (label_x, label_y),
                     cv2.FONT_HERSHEY_DUPLEX, 0.45, (255, 200, 0), 1, cv2.LINE_AA)
 
-        # Draw hand keypoint dots if visible
+        # Draw hand keypoint dots (Green when inside scanner, Yellow when outside)
         for p in detected_people:
             kpts = p.get("keypoints")
             kconfs = p.get("keypoint_confs")
             if kpts is not None and len(kpts) >= 11:
                 for wrist_idx in (9, 10):
-                    if kconfs is None or kconfs[wrist_idx] > 0.25:
+                    if kconfs is None or float(kconfs[wrist_idx]) >= 0.30:
                         wx, wy = int(kpts[wrist_idx][0]), int(kpts[wrist_idx][1])
-                        cv2.circle(annotated, (wx, wy), 4, (0, 255, 255), -1, cv2.LINE_AA)
+                        is_inside = cv2.pointPolygonTest(poly_pts, (wx, wy), False) >= 0
+                        dot_color = (74, 222, 128) if is_inside else (0, 255, 255)
+                        cv2.circle(annotated, (wx, wy), 5, dot_color, -1, cv2.LINE_AA)
+                        if is_inside:
+                            cv2.circle(annotated, (wx, wy), 9, (74, 222, 128), 2, cv2.LINE_AA)
 
         # Draw mouse dragging rectangle when user is editing ROI
         if MOUSE_DRAGGING and MOUSE_START_PT and MOUSE_CURRENT_PT:
