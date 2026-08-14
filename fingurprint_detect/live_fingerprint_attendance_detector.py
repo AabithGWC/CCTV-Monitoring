@@ -90,7 +90,7 @@ def compute_iou(boxA, boxB):
     return inter / max(union, 1e-6)
 
 
-def extract_hand_kinematics(keypoints, keypoint_confs, poly_np, poly_min_x, poly_min_y, poly_max_y, min_conf=0.25):
+def extract_hand_kinematics(keypoints, keypoint_confs, poly_np=None, poly_min_x=None, poly_min_y=None, poly_max_y=None, min_conf=0.25):
     """
     Computes an 8-point articulated hand/arm kinematic model for both left and right arms:
     1. Elbow joint
@@ -148,14 +148,15 @@ def extract_hand_kinematics(keypoints, keypoint_confs, poly_np, poly_min_x, poly
         ]
 
         # Classify Hand Intent:
-        # A) Is touching: Any point is strictly inside scanner polygon on the wall
-        is_touching = any(
-            (cv2.pointPolygonTest(poly_np, (pt[0], pt[1]), True) >= 0.0 and pt[0] >= (poly_min_x - 10))
-            for pt in all_points
-        )
-
-        # B) Is reaching: Hand is raised towards scanner height and approaching wall
-        is_reaching = (wx >= (poly_min_x - 130)) and (poly_min_y - 60 <= wy <= poly_max_y + 70)
+        is_touching = False
+        is_reaching = False
+        if poly_np is not None and poly_min_x is not None:
+            is_touching = any(
+                (cv2.pointPolygonTest(poly_np, (float(pt[0]), float(pt[1])), True) >= 0.0 and pt[0] >= (poly_min_x - 10))
+                for pt in all_points
+            )
+            if poly_min_y is not None and poly_max_y is not None:
+                is_reaching = (wx >= (poly_min_x - 130)) and (poly_min_y - 60 <= wy <= poly_max_y + 70)
 
         if is_touching:
             hand_state = "PUNCHING ✓"
@@ -689,7 +690,11 @@ def process_door_camera_frame(cam_name, frame):
         for p in detected_people:
             kpts = p.get("keypoints")
             kconfs = p.get("keypoint_confs")
-            hand_models = extract_hand_kinematics(kpts, kconfs, min_conf=0.28)
+            hand_models = extract_hand_kinematics(
+                kpts, kconfs,
+                poly_pts, min(poly_xs), min(poly_ys), max(poly_ys),
+                min_conf=0.25
+            )
             track_id = p.get("track_id")
 
             # 1. Render glowing motion trajectory trail
@@ -824,6 +829,8 @@ def process_door_camera_frame(cam_name, frame):
 
         return annotated
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         return frame
 
 
