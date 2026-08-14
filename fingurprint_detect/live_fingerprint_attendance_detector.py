@@ -252,6 +252,10 @@ class DirectionAwareAttendanceTracker:
         self.missed_punches_count = 0
         self.lock = threading.Lock()
 
+    def get_line_y(self, x, width=1920):
+        norm_x = np.clip(float(x) / max(1.0, float(width)), 0.0, 1.0)
+        return int((self.entry_line_y - 60) + norm_x * 60.0 + 80.0 * math.sin(math.pi * norm_x))
+
     def update_config(self, key, value):
         with self.lock:
             self.cfg[key] = value
@@ -411,16 +415,15 @@ class DirectionAwareAttendanceTracker:
                             state["touch_start"] = None
                             state["touch_duration"] = 0.0
 
+                cur_line_y = self.get_line_y(pcx, 1920)
+
                 # --- 4. VIOLATION DETECTION (ENTERING ONLY) ---
-                if state["direction"] == "ENTERING" and first_cy < line_y:
+                if state["direction"] == "ENTERING" and first_cy < cur_line_y:
                     if state["has_punched"]:
                         state["status"] = "COMPLIANT"
                     else:
-                        # Zone 1: In the Hallway Approaching (pcy < 580 or py1 < 450) -> ALWAYS APPROACHING
-                        in_hallway = (pcy < 580) or (py1 < 450)
-
-                        # Zone 2: Deep past scanner into the office room (py1 >= 740 or pcy >= 830)
-                        walked_past_scanner = (py1 >= 740) or (pcy >= 830) or (pcy >= line_y)
+                        in_hallway = (pcy < (cur_line_y - 180)) or (py1 < (cur_line_y - 300))
+                        walked_past_scanner = (py1 >= (cur_line_y - 50)) or (pcy >= cur_line_y)
 
                         if in_hallway:
                             state["status"] = "APPROACHING"
@@ -659,10 +662,15 @@ def process_door_camera_frame(cam_name, frame):
         # Run Direction-Aware Attendance Compliance Tracking
         results = attendance_tracker.update(detected_people)
 
-        # 1. Draw Configurable Virtual Entry Line (Bright Yellow / Cyan)
-        line_y = attendance_tracker.entry_line_y
-        cv2.line(annotated, (0, line_y), (w_img, line_y), (0, 255, 255), 2, cv2.LINE_AA)
-        cv2.putText(annotated, f"▼ VIRTUAL ENTRY LINE (ENTRY DIRECTION: DOWN) Y={line_y} ▼", (20, max(line_y - 8, 20)),
+        # 1. Draw Curved Virtual Entry Line (Smooth Arc across Hallway Floor)
+        curve_pts = []
+        for i in range(51):
+            cur_x = int(i * (w_img / 50.0))
+            cur_y = attendance_tracker.get_line_y(cur_x, w_img)
+            curve_pts.append([cur_x, cur_y])
+        curve_np = np.array(curve_pts, np.int32).reshape((-1, 1, 2))
+        cv2.polylines(annotated, [curve_np], False, (0, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(annotated, "▼ VIRTUAL ENTRY LINE (CURVED) ▼", (20, max(curve_pts[0][1] - 8, 20)),
                     cv2.FONT_HERSHEY_DUPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
 
         # 2. Draw Biometric Scanner Zone — Cyan Triangle tightly wrapping the physical scanner
@@ -678,73 +686,6 @@ def process_door_camera_frame(cam_name, frame):
         cv2.putText(annotated, "BIOMETRIC FINGERPRINT", (label_x, label_y),
                     cv2.FONT_HERSHEY_DUPLEX, 0.45, (255, 200, 0), 1, cv2.LINE_AA)
 
-        # Draw Multi-Point Articulated Hand Skeletons & Dynamic Motion Trails
-        for p in detected_people:
-            kpts = p.get("keypoints")
-            kconfs = p.get("keypoint_confs")
-            hand_models = extract_hand_kinematics(
-                kpts, kconfs,
-                poly_pts, min(poly_xs), min(poly_ys), max(poly_ys),
-                min_conf=0.25
-            )
-            track_id = p.get("track_id")
-
-            # 1. Render glowing motion trajectory trail
-            if track_id is not None and track_id in attendance_tracker.tracked_persons:
-                p_state = attendance_tracker.tracked_persons[track_id]
-                trail = list(p_state.get("hand_trail", []))
-                for i in range(1, len(trail)):
-                    alpha = i / len(trail)
-                    pt1 = (int(trail[i - 1][0]), int(trail[i - 1][1]))
-                    pt2 = (int(trail[i][0]), int(trail[i][1]))
-                    trail_color = (int(74 * alpha), int(222 * alpha), int(255 * alpha))
-                    cv2.line(annotated, pt1, pt2, trail_color, max(1, int(3 * alpha)), cv2.LINE_AA)
-
-                # Display hand speed readout
-                h_speed = p_state.get("hand_speed", 0.0)
-                if trail and h_speed > 20:
-                    lead_x, lead_y, _ = trail[-1]
-                    cv2.putText(annotated, f"Hand: {h_speed} px/s", (int(lead_x + 12), int(lead_y - 8)),
-                                cv2.FONT_HERSHEY_DUPLEX, 0.38, (0, 255, 255), 1, cv2.LINE_AA)
-
-            # 2. Render Articulated Hand Bones & 8-Point Constellation
-            for hand in hand_models:
-                ex, ey = int(hand["elbow"][0]), int(hand["elbow"][1])
-                wx, wy = int(hand["wrist"][0]), int(hand["wrist"][1])
-                px, py = int(hand["palm"][0]), int(hand["palm"][1])
-                kx, ky = int(hand["knuckle"][0]), int(hand["knuckle"][1])
-                itx, ity = int(hand["index_tip"][0]), int(hand["index_tip"][1])
-                mtx, mty = int(hand["middle_tip"][0]), int(hand["middle_tip"][1])
-                tjx, tjy = int(hand["thumb_joint"][0]), int(hand["thumb_joint"][1])
-                ttx, tty = int(hand["thumb_tip"][0]), int(hand["thumb_tip"][1])
-                pkx, pky = int(hand["pinky"][0]), int(hand["pinky"][1])
-
-                # Check if any part of hand is touching scanner
-                hand_touching = any(cv2.pointPolygonTest(poly_pts, (int(pt[0]), int(pt[1])), False) >= 0 for pt in hand["all_points"])
-                bone_color = (74, 222, 128) if hand_touching else (255, 200, 0)
-                bone_w = 2 if hand_touching else 1
-
-                # Forearm bone
-                cv2.line(annotated, (ex, ey), (wx, wy), bone_color, 2, cv2.LINE_AA)
-                # Palm & Knuckle bones
-                cv2.line(annotated, (wx, wy), (px, py), bone_color, bone_w, cv2.LINE_AA)
-                cv2.line(annotated, (px, py), (kx, ky), bone_color, bone_w, cv2.LINE_AA)
-                # Finger rays
-                cv2.line(annotated, (kx, ky), (itx, ity), bone_color, bone_w, cv2.LINE_AA)
-                cv2.line(annotated, (kx, ky), (mtx, mty), bone_color, bone_w, cv2.LINE_AA)
-                cv2.line(annotated, (wx, wy), (tjx, tjy), bone_color, bone_w, cv2.LINE_AA)
-                cv2.line(annotated, (tjx, tjy), (ttx, tty), bone_color, bone_w, cv2.LINE_AA)
-                cv2.line(annotated, (wx, wy), (pkx, pky), bone_color, bone_w, cv2.LINE_AA)
-
-                # Draw Hand Keypoint Nodes (8 points)
-                for pt in hand["all_points"]:
-                    p_x, p_y = int(pt[0]), int(pt[1])
-                    is_inside = cv2.pointPolygonTest(poly_pts, (p_x, p_y), False) >= 0
-                    node_color = (74, 222, 128) if is_inside else (0, 255, 255)
-                    cv2.circle(annotated, (p_x, p_y), 4 if not is_inside else 6, node_color, -1, cv2.LINE_AA)
-                    if is_inside:
-                        cv2.circle(annotated, (p_x, p_y), 10, (74, 222, 128), 2, cv2.LINE_AA)
-
         # Draw mouse dragging rectangle when user is editing ROI
         if MOUSE_DRAGGING and MOUSE_START_PT and MOUSE_CURRENT_PT:
             mx1 = min(MOUSE_START_PT[0], MOUSE_CURRENT_PT[0])
@@ -755,7 +696,7 @@ def process_door_camera_frame(cam_name, frame):
             cv2.putText(annotated, "DRAWING NEW SCANNER ROI...", (mx1, max(my1 - 8, 20)),
                         cv2.FONT_HERSHEY_DUPLEX, 0.45, (0, 255, 255), 1, cv2.LINE_AA)
 
-        # 3. Draw Bounding Boxes with Track ID, Direction, and Compliance Status
+        # 3. Draw Clean Bounding Boxes with Track ID, Direction, and Compliance Status
         for r in results:
             x1, y1, x2, y2 = r["box"]
             status = r["status"]
@@ -764,20 +705,17 @@ def process_door_camera_frame(cam_name, frame):
             track_id = r["track_id"]
             should_snap = r.get("should_snapshot", False)
 
-            l_h = r.get("l_hand", "DOWN")
-            r_h = r.get("r_hand", "DOWN")
-
             if status == "COMPLIANT":
                 color = (74, 222, 128)   # Lime Green
-                label = f"ID:{track_id} | ENTERING | COMPLIANT ✓ ({touch_sec}s)"
+                label = f"ID:{track_id} | ENTERING | COMPLIANT ✓"
                 thickness = 2
             elif status == "VIOLATION":
                 color = (0, 0, 255)      # Bold Red
                 label = f"ID:{track_id} | ENTERING | VIOLATION! NO FINGERPRINT"
                 thickness = 3
             elif status == "CHECKING":
-                color = (0, 165, 255)    # Orange — crossed line, grace running
-                label = f"ID:{track_id} | CHECKING (L:{l_h} | R:{r_h})"
+                color = (0, 165, 255)    # Orange — in doorway/scanner zone
+                label = f"ID:{track_id} | CHECKING..."
                 thickness = 2
             elif status == "IGNORED" or direction == "LEAVING":
                 color = (148, 163, 184)  # Slate Gray
@@ -785,7 +723,7 @@ def process_door_camera_frame(cam_name, frame):
                 thickness = 1
             else:  # APPROACHING
                 color = (200, 200, 200)  # Light gray
-                label = f"ID:{track_id} | APPROACHING (L:{l_h} | R:{r_h})"
+                label = f"ID:{track_id} | APPROACHING"
                 thickness = 1
 
             cv2.rectangle(annotated, (x1, y1), (x2, y2), color, thickness, cv2.LINE_AA)
