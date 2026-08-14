@@ -90,6 +90,86 @@ def compute_iou(boxA, boxB):
     return inter / max(union, 1e-6)
 
 
+def extract_hand_kinematics(keypoints, keypoint_confs, min_conf=0.25):
+    """
+    Computes an 8-point articulated hand/arm kinematic model for both left and right arms:
+    1. Elbow joint
+    2. Wrist base
+    3. Palm center
+    4. Knuckle joint
+    5. Index fingertip
+    6. Middle fingertip
+    7. Thumb joint
+    8. Thumb tip
+    Returns: list of dicts with all keypoints, bones, and fingertips for touch/motion tracking.
+    """
+    hands = []
+    if keypoints is None or len(keypoints) < 11:
+        return hands
+
+    # Arms to inspect: (Wrist idx, Elbow idx, Side label)
+    arms = [(10, 8, "Right"), (9, 7, "Left")]
+
+    for wrist_idx, elbow_idx, side in arms:
+        w_conf = float(keypoint_confs[wrist_idx]) if keypoint_confs is not None else 1.0
+        if w_conf < min_conf:
+            continue
+
+        wx, wy = float(keypoints[wrist_idx][0]), float(keypoints[wrist_idx][1])
+        e_conf = float(keypoint_confs[elbow_idx]) if keypoint_confs is not None else 0.0
+
+        if e_conf >= min_conf:
+            ex, ey = float(keypoints[elbow_idx][0]), float(keypoints[elbow_idx][1])
+            vx, vy = wx - ex, wy - ey
+            L = math.hypot(vx, vy)
+            if L > 10:
+                ux, uy = vx / L, vy / L
+                # Normal vector perpendicular to forearm
+                nx, ny = (-uy, ux) if side == "Right" else (uy, -ux)
+            else:
+                ux, uy, nx, ny = 1.0, 0.0, 0.0, 1.0
+                L = 60.0
+        else:
+            ux, uy, nx, ny = 1.0, 0.0, 0.0, 1.0
+            L = 60.0
+            ex, ey = wx - 60.0, wy
+
+        # Multi-Point Hand Constellation:
+        pt_wrist = (wx, wy)
+        pt_palm = (wx + ux * 0.18 * L, wy + uy * 0.18 * L)
+        pt_knuckle = (wx + ux * 0.32 * L, wy + uy * 0.32 * L)
+        pt_index_tip = (wx + ux * 0.46 * L, wy + uy * 0.46 * L)
+        pt_middle_tip = (wx + ux * 0.50 * L, wy + uy * 0.50 * L)
+        pt_thumb_joint = (wx + ux * 0.15 * L + nx * 0.16 * L, wy + uy * 0.15 * L + ny * 0.16 * L)
+        pt_thumb_tip = (wx + ux * 0.32 * L + nx * 0.24 * L, wy + uy * 0.32 * L + ny * 0.24 * L)
+        pt_pinky = (wx + ux * 0.22 * L - nx * 0.14 * L, wy + uy * 0.22 * L - ny * 0.14 * L)
+
+        all_points = [
+            pt_wrist, pt_palm, pt_knuckle, pt_index_tip,
+            pt_middle_tip, pt_thumb_joint, pt_thumb_tip, pt_pinky
+        ]
+
+        hands.append({
+            "side": side,
+            "elbow": (ex, ey),
+            "wrist": pt_wrist,
+            "palm": pt_palm,
+            "knuckle": pt_knuckle,
+            "thumb_joint": pt_thumb_joint,
+            "thumb_tip": pt_thumb_tip,
+            "index_tip": pt_index_tip,
+            "middle_tip": pt_middle_tip,
+            "pinky": pt_pinky,
+            "fingertips": [pt_thumb_tip, pt_index_tip, pt_middle_tip],
+            "all_points": all_points,
+            "unit_vec": (ux, uy),
+            "conf": w_conf,
+            "length": L
+        })
+
+    return hands
+
+
 @dataclass
 class CameraConfig:
     name: str
@@ -127,12 +207,11 @@ def load_camera_configs(selected_cam=1) -> CameraConfig:
 class DirectionAwareAttendanceTracker:
     """
     State Machine Tracker for Front Door Fingerprint Compliance:
-    - ENTERING: Tracks person from approach through doorway into room.
-                Person can casually touch scanner at ANY point during entry.
-                Violation is evaluated ONLY AFTER the person has fully entered the room past the door zone.
-    - LEAVING: Completely IGNORED (Gray). No compliance checks, no alerts, no snapshots.
+    - Multi-Point Hand & Finger Motion Tracking (8 articulated points per hand)
+    - Velocity Vector & Trajectory Motion Analysis
+    - ENTERING: Evaluates biometric scan compliance using finger/hand kinematics.
+    - LEAVING: Completely IGNORED (Gray).
     - Duplicate Prevention: Each track_id is processed and logged EXACTLY ONCE.
-    - Occlusion Tolerance: Memory retains person tracking state across brief detection losses.
     """
 
     def __init__(self, config=None):
@@ -142,15 +221,12 @@ class DirectionAwareAttendanceTracker:
         self.entry_direction = self.cfg["entry_direction"]  # "down" or "up"
         self.timeout_sec = self.cfg.get("fingerprint_timeout_sec", 3.0)
         self.touch_required_sec = self.cfg.get("touch_required_sec", 0.1)
-        # Generous grace period: wait until person has completely passed into room before concluding violation
         self.violation_grace_sec = self.cfg.get("violation_grace_sec", 3.5)
 
-        # Default polygon stored as absolute pixels based on 1920×1080.
-        # In process_door_camera_frame this is recomputed each frame from actual W×H.
         self.scanner_polygon = self.cfg.get("scanner_polygon", [
-            [int(1920 * 0.870), int(1080 * 0.640)],  # Left corner  → (1670, 691)
-            [int(1920 * 0.958), int(1080 * 0.592)],  # Top-right    → (1839, 639)
-            [int(1920 * 0.942), int(1080 * 0.706)]   # Bottom-right → (1809, 763)
+            [int(1920 * 0.885), int(1080 * 0.635)],
+            [int(1920 * 0.962), int(1080 * 0.585)],
+            [int(1920 * 0.948), int(1080 * 0.720)]
         ])
         self.tracked_persons = {}  # track_id -> dict state
         self.next_track_id = 1
@@ -191,32 +267,19 @@ class DirectionAwareAttendanceTracker:
                 pcx, pcy = (px1 + px2) / 2, (py1 + py2) / 2
                 raw_track_id = p.get("track_id")
 
-                # --- 1. PRECISE SCANNER TOUCH / HAND PROXIMITY DETECTION ---
+                # --- 1. MULTI-POINT ARTICULATED HAND KINEMATICS & SCANNER TOUCH ---
                 is_touching_scanner = False
-                detected_hand_pts = []
+                touching_points = []
+                hand_models = extract_hand_kinematics(p.get("keypoints"), p.get("keypoint_confs"), min_conf=0.28)
 
-                keypoints = p.get("keypoints")
-                keypoint_confs = p.get("keypoint_confs")
-
-                # High-Precision Pose Keypoints: Left & Right Wrists (Pts 9 & 10) + Projected Fingertips
-                if keypoints is not None and len(keypoints) >= 11:
-                    for wrist_idx, elbow_idx in [(10, 8), (9, 7)]:
-                        w_conf = float(keypoint_confs[wrist_idx]) if keypoint_confs is not None else 1.0
-                        if w_conf >= 0.30:
-                            wx, wy = float(keypoints[wrist_idx][0]), float(keypoints[wrist_idx][1])
-                            detected_hand_pts.append((wx, wy))
-                            if keypoint_confs is not None and float(keypoint_confs[elbow_idx]) >= 0.30:
-                                ex, ey = float(keypoints[elbow_idx][0]), float(keypoints[elbow_idx][1])
-                                fx = wx + 0.25 * (wx - ex)
-                                fy = wy + 0.25 * (wy - ey)
-                                detected_hand_pts.append((fx, fy))
-
-                    for hx, hy in detected_hand_pts:
-                        # Strict: Hand point must be physically inside or directly touching the scanner polygon
+                for hand in hand_models:
+                    for pt in hand["all_points"]:
+                        hx, hy = pt
+                        # Strict: Test if any hand/finger point is inside or directly on the physical scanner polygon
                         dist = cv2.pointPolygonTest(poly_np, (hx, hy), True)
                         if dist >= 0.0 and hx >= (poly_min_x - 10):
                             is_touching_scanner = True
-                            break
+                            touching_points.append(pt)
 
                 # Matching ID: use YOLO tracker ID if available, otherwise match by Centroid + IoU
                 matched_id = raw_track_id
@@ -245,6 +308,7 @@ class DirectionAwareAttendanceTracker:
                         "last_seen": now,
                         "first_centroid": (pcx, pcy),
                         "positions": deque([(pcx, pcy)], maxlen=20),
+                        "hand_trail": deque(maxlen=15),
                         "direction": init_dir,
                         "status": init_status,
                         "has_punched": False,
@@ -257,6 +321,7 @@ class DirectionAwareAttendanceTracker:
                         "last_box": [px1, py1, px2, py2],
                         "conf": p["conf"],
                         "line_crossed_at": None,
+                        "hand_speed": 0.0,
                     }
 
                 state = self.tracked_persons[matched_id]
@@ -265,6 +330,16 @@ class DirectionAwareAttendanceTracker:
                 state["last_box"] = [px1, py1, px2, py2]
                 state["positions"].append((pcx, pcy))
                 state["conf"] = p["conf"]
+
+                # Track Hand Movement Velocity & Trail
+                if hand_models:
+                    lead_wrist = hand_models[0]["wrist"]
+                    if state["hand_trail"]:
+                        last_hx, last_hy, last_ht = state["hand_trail"][-1]
+                        dt = max(now - last_ht, 1e-4)
+                        move_dist = math.hypot(lead_wrist[0] - last_hx, lead_wrist[1] - last_hy)
+                        state["hand_speed"] = round(move_dist / dt, 1)
+                    state["hand_trail"].append((lead_wrist[0], lead_wrist[1], now))
 
                 first_cx, first_cy = state["first_centroid"]
                 dy_total = pcy - first_cy  # positive = moving DOWN into office, negative = moving UP away
@@ -582,19 +657,68 @@ def process_door_camera_frame(cam_name, frame):
         cv2.putText(annotated, "BIOMETRIC FINGERPRINT", (label_x, label_y),
                     cv2.FONT_HERSHEY_DUPLEX, 0.45, (255, 200, 0), 1, cv2.LINE_AA)
 
-        # Draw hand keypoint dots (Green when inside scanner, Yellow when outside)
+        # Draw Multi-Point Articulated Hand Skeletons & Dynamic Motion Trails
         for p in detected_people:
             kpts = p.get("keypoints")
             kconfs = p.get("keypoint_confs")
-            if kpts is not None and len(kpts) >= 11:
-                for wrist_idx in (9, 10):
-                    if kconfs is None or float(kconfs[wrist_idx]) >= 0.30:
-                        wx, wy = int(kpts[wrist_idx][0]), int(kpts[wrist_idx][1])
-                        is_inside = cv2.pointPolygonTest(poly_pts, (wx, wy), False) >= 0
-                        dot_color = (74, 222, 128) if is_inside else (0, 255, 255)
-                        cv2.circle(annotated, (wx, wy), 5, dot_color, -1, cv2.LINE_AA)
-                        if is_inside:
-                            cv2.circle(annotated, (wx, wy), 9, (74, 222, 128), 2, cv2.LINE_AA)
+            hand_models = extract_hand_kinematics(kpts, kconfs, min_conf=0.28)
+            track_id = p.get("track_id")
+
+            # 1. Render glowing motion trajectory trail
+            if track_id is not None and track_id in attendance_tracker.tracked_persons:
+                p_state = attendance_tracker.tracked_persons[track_id]
+                trail = list(p_state.get("hand_trail", []))
+                for i in range(1, len(trail)):
+                    alpha = i / len(trail)
+                    pt1 = (int(trail[i - 1][0]), int(trail[i - 1][1]))
+                    pt2 = (int(trail[i][0]), int(trail[i][1]))
+                    trail_color = (int(74 * alpha), int(222 * alpha), int(255 * alpha))
+                    cv2.line(annotated, pt1, pt2, trail_color, max(1, int(3 * alpha)), cv2.LINE_AA)
+
+                # Display hand speed readout
+                h_speed = p_state.get("hand_speed", 0.0)
+                if trail and h_speed > 20:
+                    lead_x, lead_y, _ = trail[-1]
+                    cv2.putText(annotated, f"Hand: {h_speed} px/s", (int(lead_x + 12), int(lead_y - 8)),
+                                cv2.FONT_HERSHEY_DUPLEX, 0.38, (0, 255, 255), 1, cv2.LINE_AA)
+
+            # 2. Render Articulated Hand Bones & 8-Point Constellation
+            for hand in hand_models:
+                ex, ey = int(hand["elbow"][0]), int(hand["elbow"][1])
+                wx, wy = int(hand["wrist"][0]), int(hand["wrist"][1])
+                px, py = int(hand["palm"][0]), int(hand["palm"][1])
+                kx, ky = int(hand["knuckle"][0]), int(hand["knuckle"][1])
+                itx, ity = int(hand["index_tip"][0]), int(hand["index_tip"][1])
+                mtx, mty = int(hand["middle_tip"][0]), int(hand["middle_tip"][1])
+                tjx, tjy = int(hand["thumb_joint"][0]), int(hand["thumb_joint"][1])
+                ttx, tty = int(hand["thumb_tip"][0]), int(hand["thumb_tip"][1])
+                pkx, pky = int(hand["pinky"][0]), int(hand["pinky"][1])
+
+                # Check if any part of hand is touching scanner
+                hand_touching = any(cv2.pointPolygonTest(poly_pts, (int(pt[0]), int(pt[1])), False) >= 0 for pt in hand["all_points"])
+                bone_color = (74, 222, 128) if hand_touching else (255, 200, 0)
+                bone_w = 2 if hand_touching else 1
+
+                # Forearm bone
+                cv2.line(annotated, (ex, ey), (wx, wy), bone_color, 2, cv2.LINE_AA)
+                # Palm & Knuckle bones
+                cv2.line(annotated, (wx, wy), (px, py), bone_color, bone_w, cv2.LINE_AA)
+                cv2.line(annotated, (px, py), (kx, ky), bone_color, bone_w, cv2.LINE_AA)
+                # Finger rays
+                cv2.line(annotated, (kx, ky), (itx, ity), bone_color, bone_w, cv2.LINE_AA)
+                cv2.line(annotated, (kx, ky), (mtx, mty), bone_color, bone_w, cv2.LINE_AA)
+                cv2.line(annotated, (wx, wy), (tjx, tjy), bone_color, bone_w, cv2.LINE_AA)
+                cv2.line(annotated, (tjx, tjy), (ttx, tty), bone_color, bone_w, cv2.LINE_AA)
+                cv2.line(annotated, (wx, wy), (pkx, pky), bone_color, bone_w, cv2.LINE_AA)
+
+                # Draw Hand Keypoint Nodes (8 points)
+                for pt in hand["all_points"]:
+                    p_x, p_y = int(pt[0]), int(pt[1])
+                    is_inside = cv2.pointPolygonTest(poly_pts, (p_x, p_y), False) >= 0
+                    node_color = (74, 222, 128) if is_inside else (0, 255, 255)
+                    cv2.circle(annotated, (p_x, p_y), 4 if not is_inside else 6, node_color, -1, cv2.LINE_AA)
+                    if is_inside:
+                        cv2.circle(annotated, (p_x, p_y), 10, (74, 222, 128), 2, cv2.LINE_AA)
 
         # Draw mouse dragging rectangle when user is editing ROI
         if MOUSE_DRAGGING and MOUSE_START_PT and MOUSE_CURRENT_PT:
